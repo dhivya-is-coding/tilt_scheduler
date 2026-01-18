@@ -1,0 +1,16 @@
+{
+# supports early, late, between X-Y, after X, any (no constraints), none (not coming this week)
+  "time_prefs": {
+    "Amanda": "early",
+    "Brett": "late",
+    "Chris O": "between 7:00-7:30",
+    "Dhivya": "any",
+    "Daniel": "none", 
+    "Bashi": "after 7:45"
+  },
+  "omitted_players": ["Griff"], # players who won't be playing this season/ever
+  "min_matches_per_player": 2,
+  "max_matches_per_player": 3,
+  "lookback_weeks": 3, # how many weeks to look back for match history
+  "global_time_window": ["6:00", "9:45"]
+}
