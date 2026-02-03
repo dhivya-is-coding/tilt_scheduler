@@ -3,6 +3,24 @@ import ast
 from pathlib import Path
 from typing import Dict, Any, List
 
+# import importlib
+# import sys
+# import types
+
+# # Ensure a minimal, well-formed pyarrow module so that pandas' optional
+# # pyarrow integration does not crash even if pyarrow is a namespace package
+# # without a __version__ attribute. We don't rely on real pyarrow features in
+# # this app, and Streamlit is configured to use legacy dataframe serialization.
+# try:
+#     _pa = importlib.import_module("pyarrow")
+# except ImportError:
+#     _pa = types.ModuleType("pyarrow")
+#     _pa.__version__ = "0.0.0"
+#     sys.modules["pyarrow"] = _pa
+# else:
+#     if not hasattr(_pa, "__version__"):
+#         _pa.__version__ = "0.0.0"
+
 import pandas as pd
 import streamlit as st
 
@@ -244,22 +262,73 @@ def main() -> None:
 
         st.dataframe(grid_to_show, width="stretch")
 
-        # st.subheader("Raw schedule records")
-        # raw_df = schedule_df.sort_values(["slot_index", "table"]).reset_index(drop=True)
+        players_series = pd.concat([schedule_df["player1"], schedule_df["player2"]])
+        match_counts = players_series.value_counts().sort_index()
+        players_with_less_than_2 = match_counts[match_counts < 2]
+        players_with_3 = match_counts[match_counts == 3]
 
-        # if selected_player != "(none)" and not raw_df.empty:
-        #     def _highlight_row(row: pd.Series) -> list[str]:
-        #         is_match = (row["player1"] == selected_player) or (
-        #             row["player2"] == selected_player
-        #         )
-        #         style = "background-color: #70bf67; font-weight: 600;" if is_match else ""
-        #         return [style] * len(row)
+        st.subheader("Schedule verification")
 
-        #     raw_to_show = raw_df.style.apply(_highlight_row, axis=1)
-        # else:
-        #     raw_to_show = raw_df
+        if players_with_less_than_2.empty:
+            st.success("All players in the schedule have at least 2 matches.")
+        else:
+            st.warning("Some players have fewer than 2 matches.")
+            fewer_df = (
+                players_with_less_than_2
+                .reset_index(name="matches")
+                .rename(columns={"index": "player"})
+            )
+            st.dataframe(fewer_df, width="stretch")
 
-        # st.dataframe(raw_to_show, width="stretch")
+        if not players_with_3.empty:
+            players3_df = (
+                players_with_3
+                .reset_index(name="matches")
+                .rename(columns={"index": "player"})
+            )
+            st.write("Players with 3 matches:")
+            st.dataframe(players3_df, width="stretch")
+
+        gaps = []
+        slot_minutes_map = {
+            t: int(t.split(":")[0]) * 60 + int(t.split(":")[1])
+            for t in TIME_SLOTS
+        }
+
+        for player, count in match_counts.items():
+            subset = schedule_df[
+                (schedule_df["player1"] == player)
+                | (schedule_df["player2"] == player)
+            ].sort_values("slot_index")
+            times = subset["slot_time"].tolist()
+            for i in range(len(times) - 1):
+                start_time = times[i]
+                end_time = times[i + 1]
+                gap_minutes = (
+                    slot_minutes_map[end_time] - slot_minutes_map[start_time]
+                )
+                gaps.append(
+                    {
+                        "player": player,
+                        "first_match": start_time,
+                        "last_match": end_time,
+                        "gap_minutes": gap_minutes,
+                    }
+                )
+
+        if gaps:
+            total_gap = sum(g["gap_minutes"] for g in gaps)
+            avg_gap = total_gap / len(gaps)
+            st.write(
+                f"Average time between consecutive matches: {avg_gap:.1f} minutes"
+            )
+
+            gaps_sorted = sorted(gaps, key=lambda g: g["gap_minutes"], reverse=True)
+            top5 = gaps_sorted[:5]
+            st.write("Top 5 largest gaps between consecutive matches (per player):")
+            st.dataframe(pd.DataFrame(top5), width="stretch")
+        else:
+            st.info("Not enough data to compute time between matches.")
     else:
         st.info("Provide constraints and click 'Run scheduler' in the sidebar.")
 

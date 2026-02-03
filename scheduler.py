@@ -154,7 +154,7 @@ def generate_weekly_schedule(
     tables_per_slot: int = 3,
     lookback_weeks: int = 3,
     global_time_window: Optional[tuple[str, str]] = None,
-    elo_weight: int = 1,
+    elo_weight: int = 100,
 ) -> List[Dict[str, Any]]:
     """
     Returns a list of matches like:
@@ -409,7 +409,7 @@ def generate_weekly_schedule(
 
     # 4b) Time-of-night component: push matches earlier in the evening by
     # penalizing later slots relative to the earliest slot.
-    time_weight = 1  # Increase to more strongly prefer earlier slots.
+    time_weight = 100  # Increase to more strongly prefer earlier slots.
     if time_weight > 0 and slot_minutes:
         for m_idx, (_i, _j) in enumerate(pairs):
             for s in allowed_slot_indices:
@@ -423,7 +423,7 @@ def generate_weekly_schedule(
 
     # 4c) Gap penalty component: for each player, penalize pairs of
     # slots where they both play, weighted by how far apart the slots are.
-    gap_weight = 2  # Increase this to prioritize tighter schedules more strongly.
+    gap_weight = 10  # Higher weight -> much stronger preference for small gaps.
     if gap_weight > 0 and slot_minutes:
         for p_idx, name_p in enumerate(players):
             if name_p in omitted_players or name_p in unavailable_players:
