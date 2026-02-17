@@ -142,6 +142,35 @@ def build_player_availability_from_time_prefs(
     return availability
 
 
+def parse_table_prefs(
+    table_prefs: Optional[Dict[str, str]] = None,
+) -> Dict[str, Set[int]]:
+    """Parse table preferences into per-player allowed table sets (0-indexed).
+
+    Input format (1-indexed, user-facing):
+        {"PlayerA": "1", "PlayerB": "1,2", "PlayerC": "any"}
+    Where "1" = table index 0, "1,2" = table indices {0, 1}, "any" = all.
+
+    Players not in the dict or with "any"/"all" have no restriction
+    (omitted from the returned dict).
+    """
+    if not table_prefs:
+        return {}
+    result: Dict[str, Set[int]] = {}
+    for player, pref in table_prefs.items():
+        pref_str = str(pref).strip().lower()
+        if not pref_str or pref_str in ("any", "all"):
+            continue
+        try:
+            indices = {int(x.strip()) - 1 for x in pref_str.split(",")}
+            indices = {i for i in indices if i >= 0}
+            if indices:
+                result[player] = indices
+        except ValueError:
+            continue  # malformed → no restriction
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Find ELO-optimal pairings
 # ---------------------------------------------------------------------------
@@ -315,6 +344,103 @@ def _solve_phase1_pairings(
 # Phase 2: Greedy compact placement of fixed matches
 # ---------------------------------------------------------------------------
 
+def _assign_tables_in_slot(
+    matches_in_slot: List[Dict[str, Any]],
+    tables_per_slot: int,
+    player_table_prefs: Dict[str, Set[int]],
+) -> bool:
+    """Assign table indices to matches within a single slot, respecting prefs.
+
+    Modifies the ``table`` field of each match dict in-place.
+    Returns True if a valid assignment was found, False otherwise (caller
+    should fall back to sequential numbering).
+    """
+    n = len(matches_in_slot)
+    if n == 0:
+        return True
+
+    available_tables = list(range(tables_per_slot))
+
+    # Per-match allowed tables (intersection of both players' prefs)
+    match_allowed: List[Set[int]] = []
+    for rec in matches_in_slot:
+        allowed = set(available_tables)
+        for key in ("player1", "player2"):
+            player = rec[key]
+            if player in player_table_prefs:
+                allowed &= player_table_prefs[player]
+        match_allowed.append(allowed)
+
+    # Backtracking (n <= tables_per_slot, typically 3 — exhaustive is instant)
+    assignment: List[Optional[int]] = [None] * n
+    used: Set[int] = set()
+
+    def _backtrack(idx: int) -> bool:
+        if idx == n:
+            return True
+        for t in sorted(match_allowed[idx]):  # prefer lower table index
+            if t in used:
+                continue
+            assignment[idx] = t
+            used.add(t)
+            if _backtrack(idx + 1):
+                return True
+            used.remove(t)
+        return False
+
+    if not _backtrack(0):
+        return False
+
+    for i, rec in enumerate(matches_in_slot):
+        rec["table"] = assignment[i]
+    return True
+
+
+def _can_assign_tables(
+    matches_in_slot: List[Dict[str, Any]],
+    tables_per_slot: int,
+    player_table_prefs: Dict[str, Set[int]],
+) -> bool:
+    """Check if table preferences can be satisfied for matches in a slot.
+
+    Non-mutating version of ``_assign_tables_in_slot`` — returns True/False
+    without modifying any match dict.  Used during greedy placement and
+    local search to reject (match, slot) combinations that would create
+    infeasible table configurations.
+    """
+    n = len(matches_in_slot)
+    if n == 0:
+        return True
+
+    available_tables = list(range(tables_per_slot))
+
+    match_allowed: List[Set[int]] = []
+    for rec in matches_in_slot:
+        allowed = set(available_tables)
+        for key in ("player1", "player2"):
+            player = rec[key]
+            if player in player_table_prefs:
+                allowed &= player_table_prefs[player]
+        if not allowed:
+            return False  # this match cannot go on any table
+        match_allowed.append(allowed)
+
+    used: Set[int] = set()
+
+    def _bt(idx: int) -> bool:
+        if idx == n:
+            return True
+        for t in match_allowed[idx]:
+            if t not in used:
+                used.add(t)
+                if _bt(idx + 1):
+                    return True
+                used.remove(t)
+        return False
+
+    return _bt(0)
+
+
 def _solve_phase2_placement(
     fixed_matches: List[Tuple[int, int]],
     players: List[str],
@@ -324,6 +450,7 @@ def _solve_phase2_placement(
     omitted_players: Set[str],
     unavailable_players: Set[str],
     time_slots: List[str],
+    player_table_prefs: Optional[Dict[str, Set[int]]] = None,
 ) -> List[Dict[str, Any]]:
     """Phase 2: Greedily assign fixed matches to (slot, table) pairs.
 
@@ -375,6 +502,12 @@ def _solve_phase2_placement(
     # player_slots[player_idx] = sorted list of slots where player is placed
     player_slots: Dict[int, List[int]] = {}
 
+    # Resolved table prefs (0-indexed sets); empty dict if none
+    prefs = player_table_prefs or {}
+    # slot_match_recs[s] = list of schedule dicts placed in slot s
+    # (used for table-feasibility checks during greedy placement)
+    slot_match_recs: Dict[int, List[Dict[str, Any]]] = {s: [] for s in sorted_slots}
+
     schedule: List[Dict[str, Any]] = []
 
     # Iteratively place matches one at a time, always picking the globally
@@ -394,6 +527,14 @@ def _solve_phase2_placement(
                 # Hard constraint: no double-booking
                 if i in player_in_slot[s] or j in player_in_slot[s]:
                     continue
+
+                # Hard constraint: table preferences must be satisfiable
+                if prefs:
+                    hypo = slot_match_recs[s] + [
+                        {"player1": players[i], "player2": players[j], "table": 0}
+                    ]
+                    if not _can_assign_tables(hypo, tables_per_slot, prefs):
+                        continue
 
                 # --- Scoring ---
                 adjacency = 0
@@ -445,15 +586,15 @@ def _solve_phase2_placement(
             else:
                 bisect.insort(player_slots[p_idx], best_slot)
 
-        schedule.append(
-            {
-                "slot_index": best_slot,
-                "slot_time": time_slots[best_slot],
-                "table": slot_table_count[best_slot] - 1,
-                "player1": players[i_best],
-                "player2": players[j_best],
-            }
-        )
+        rec = {
+            "slot_index": best_slot,
+            "slot_time": time_slots[best_slot],
+            "table": slot_table_count[best_slot] - 1,
+            "player1": players[i_best],
+            "player2": players[j_best],
+        }
+        schedule.append(rec)
+        slot_match_recs[best_slot].append(rec)
         unplaced.remove(best_match)
 
     # --- Post-processing: local search to reduce gaps ---
@@ -515,6 +656,25 @@ def _solve_phase2_placement(
             return False
         if len(players_in_slot_b) != len(set(players_in_slot_b)):
             return False
+
+        # Check table preference feasibility for both affected slots
+        if prefs:
+            recs_in_a: List[Dict[str, Any]] = []
+            recs_in_b: List[Dict[str, Any]] = []
+            for k, rec in enumerate(sched):
+                if k == idx_a or k == idx_b:
+                    continue
+                if rec["slot_index"] == slot_a:
+                    recs_in_a.append(rec)
+                elif rec["slot_index"] == slot_b:
+                    recs_in_b.append(rec)
+            # After swap: rec_b goes to slot_a, rec_a goes to slot_b
+            recs_in_a.append(rec_b)
+            recs_in_b.append(rec_a)
+            if not _can_assign_tables(recs_in_a, tables_per_slot, prefs):
+                return False
+            if not _can_assign_tables(recs_in_b, tables_per_slot, prefs):
+                return False
 
         return True
 
@@ -581,6 +741,15 @@ def _solve_phase2_placement(
                 if p1_name in new_slot_ps or p2_name in new_slot_ps:
                     continue
 
+                # Table preference feasibility for destination slot
+                if prefs:
+                    hypo = [
+                        r for r in schedule
+                        if r["slot_index"] == new_s and r is not rec
+                    ] + [rec]
+                    if not _can_assign_tables(hypo, tables_per_slot, prefs):
+                        continue
+
                 # Try the move
                 old_time = rec["slot_time"]
                 rec["slot_index"] = new_s
@@ -610,13 +779,26 @@ def _solve_phase2_placement(
             f"Phase 2 greedy: {len(unplaced)} match(es) could not be placed."
         )
 
-    # Reassign table numbers within each slot (may have changed after swaps)
+    # Reassign table numbers within each slot, respecting table preferences
+    prefs = player_table_prefs or {}
     schedule.sort(key=lambda r: (r["slot_index"], r["table"]))
-    table_counter: Dict[int, int] = {}
+
+    # Group matches by slot
+    slot_groups: Dict[int, List[Dict[str, Any]]] = {}
     for rec in schedule:
-        s = rec["slot_index"]
-        rec["table"] = table_counter.get(s, 0)
-        table_counter[s] = table_counter.get(s, 0) + 1
+        slot_groups.setdefault(rec["slot_index"], []).append(rec)
+
+    for s in sorted(slot_groups):
+        matches_in_slot = slot_groups[s]
+        if not _assign_tables_in_slot(matches_in_slot, tables_per_slot, prefs):
+            # Preference-aware assignment infeasible — fall back to sequential
+            import warnings
+            warnings.warn(
+                f"Table preference conflict in slot {s} "
+                f"({time_slots[s]}); falling back to sequential assignment."
+            )
+            for idx, rec in enumerate(matches_in_slot):
+                rec["table"] = idx
 
     return schedule
 
@@ -639,6 +821,7 @@ def generate_weekly_schedule(
     lookback_weeks: int = 3,
     global_time_window: Optional[tuple[str, str]] = None,
     elo_weight: int = 100,
+    table_prefs: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Two-phase scheduler: ELO-optimal pairings, then compact placement.
 
@@ -669,6 +852,7 @@ def generate_weekly_schedule(
       - Prefer earlier time slots.
     """
     omitted_players = omitted_players or set()
+    player_table_prefs = parse_table_prefs(table_prefs)
 
     # ---- Shared Setup ----
 
@@ -782,6 +966,7 @@ def generate_weekly_schedule(
             omitted_players=omitted_players,
             unavailable_players=unavailable_players,
             time_slots=time_slots,
+            player_table_prefs=player_table_prefs,
         )
     except RuntimeError:
         # Fallback: use Phase 1's slot assignments if Phase 2 fails

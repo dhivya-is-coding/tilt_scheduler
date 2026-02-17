@@ -31,6 +31,12 @@ player_availability = sch.build_player_availability_from_time_prefs(
     time_prefs=time_prefs,
 )
 
+# Per-player table preferences: "1" = table 1 only, "1,2" = tables 1 or 2
+table_prefs = {
+    "Amanda": "1",       # only table 1
+    "Brett": "1,2",      # tables 1 or 2
+}
+
 # Example: omitted players for this week
 omitted_players = {"Griff"}  # or set()
 
@@ -49,6 +55,7 @@ phase1_schedule, phase2_schedule = sch.generate_weekly_schedule(
     tables_per_slot=3,
     lookback_weeks=3,
     global_time_window=("6:00", "9:45"),  # or None
+    table_prefs=table_prefs,
 )
 
 print("=== Phase 1: ELO-Optimal Pairings ===")

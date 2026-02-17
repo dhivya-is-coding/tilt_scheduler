@@ -83,6 +83,7 @@ def run_schedule_with_constraints(
 
     # Extract constraint fields (with sensible defaults)
     time_prefs: Dict[str, Any] = constraints.get("time_prefs", {})
+    table_prefs: Dict[str, str] = constraints.get("table_prefs", {})
     omitted_players = set(constraints.get("omitted_players", []))
     min_matches = int(constraints.get("min_matches_per_player", 2))
     max_matches = int(constraints.get("max_matches_per_player", 3))
@@ -115,6 +116,7 @@ def run_schedule_with_constraints(
         tables_per_slot=TABLES_PER_SLOT,
         lookback_weeks=lookback_weeks,
         global_time_window=global_time_window,
+        table_prefs=table_prefs,
     )
 
     return pd.DataFrame(phase1_records), pd.DataFrame(phase2_records)
