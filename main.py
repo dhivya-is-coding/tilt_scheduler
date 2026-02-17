@@ -36,7 +36,7 @@ omitted_players = {"Griff"}  # or set()
 
 current_week = matches_df["week"].max() + 1  # schedule next week, for example
 
-schedule = sch.generate_weekly_schedule(
+phase1_schedule, phase2_schedule = sch.generate_weekly_schedule(
     players=players,
     elos=elos,
     past_matches=matches_df,
@@ -51,5 +51,8 @@ schedule = sch.generate_weekly_schedule(
     global_time_window=("6:00", "9:45"),  # or None
 )
 
-schedule_df = pd.DataFrame(schedule)
-print(schedule_df)
+print("=== Phase 1: ELO-Optimal Pairings ===")
+print(pd.DataFrame(phase1_schedule))
+print()
+print("=== Phase 2: Optimized Placement ===")
+print(pd.DataFrame(phase2_schedule))

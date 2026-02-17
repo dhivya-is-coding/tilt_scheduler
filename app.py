@@ -1,7 +1,7 @@
 import json
 import ast
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 # import importlib
 # import sys
@@ -72,8 +72,10 @@ def load_constraints_from_file(path: Path) -> Dict[str, Any]:
     return load_constraints_from_text(text)
 
 
-def run_schedule_with_constraints(constraints: Dict[str, Any]) -> pd.DataFrame:
-    """Run the scheduler using the given constraints and return a schedule DataFrame."""
+def run_schedule_with_constraints(
+    constraints: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the scheduler and return (phase1_df, phase2_df)."""
     # Load league data from Google Sheet via loader.py
     matches_df, elos_df = ld.extract_by_weektags_and_final_elos(ld.df)
     players = elos_df["player"].tolist()
@@ -100,7 +102,7 @@ def run_schedule_with_constraints(constraints: Dict[str, Any]) -> pd.DataFrame:
 
     current_week = int(matches_df["week"].max()) + 1
 
-    schedule_records = sch.generate_weekly_schedule(
+    phase1_records, phase2_records = sch.generate_weekly_schedule(
         players=players,
         elos=elos,
         past_matches=matches_df,
@@ -115,7 +117,7 @@ def run_schedule_with_constraints(constraints: Dict[str, Any]) -> pd.DataFrame:
         global_time_window=global_time_window,
     )
 
-    return pd.DataFrame(schedule_records)
+    return pd.DataFrame(phase1_records), pd.DataFrame(phase2_records)
 
 
 def schedule_to_grid(schedule_df: pd.DataFrame) -> pd.DataFrame:
@@ -148,6 +150,113 @@ def schedule_to_grid(schedule_df: pd.DataFrame) -> pd.DataFrame:
     grid = pd.DataFrame(rows, index=index, columns=column_labels)
     grid.index.name = "Time"
     return grid
+
+
+def _make_style_fn(grid: pd.DataFrame, selected_player: str):
+    """Create a column styling function for a schedule grid."""
+    highlight_style = "background-color: #70bf67; font-weight: 600;"
+    border_style = "border-left: 2px solid #999;"
+
+    def _style_column(col: pd.Series) -> list[str]:
+        col_name = col.name
+        is_p2_col = isinstance(col_name, str) and col_name.endswith("P2")
+        styles: list[str] = []
+
+        for idx in col.index:
+            style_parts: List[str] = []
+
+            if is_p2_col:
+                style_parts.append(border_style)
+
+            if selected_player != "(none)" and isinstance(col_name, str) and col_name.startswith("Table "):
+                try:
+                    parts = col_name.split()
+                    table_number = int(parts[1])
+                    p1_col = f"Table {table_number} P1"
+                    p2_col = f"Table {table_number} P2"
+
+                    p1_val = grid.at[idx, p1_col] if p1_col in grid.columns else ""
+                    p2_val = grid.at[idx, p2_col] if p2_col in grid.columns else ""
+
+                    if p1_val == selected_player or p2_val == selected_player:
+                        style_parts.append(highlight_style)
+                except (IndexError, ValueError):
+                    pass
+
+            styles.append(" ".join(style_parts))
+
+        return styles
+
+    return _style_column
+
+
+def _show_verification(schedule_df: pd.DataFrame) -> None:
+    """Display schedule verification stats."""
+    players_series = pd.concat([schedule_df["player1"], schedule_df["player2"]])
+    match_counts = players_series.value_counts().sort_index()
+    players_with_less_than_2 = match_counts[match_counts < 2]
+    players_with_3 = match_counts[match_counts == 3]
+
+    if players_with_less_than_2.empty:
+        st.success("All players in the schedule have at least 2 matches.")
+    else:
+        st.warning("Some players have fewer than 2 matches.")
+        fewer_df = (
+            players_with_less_than_2
+            .reset_index(name="matches")
+            .rename(columns={"index": "player"})
+        )
+        st.dataframe(fewer_df, width="stretch")
+
+    if not players_with_3.empty:
+        players3_df = (
+            players_with_3
+            .reset_index(name="matches")
+            .rename(columns={"index": "player"})
+        )
+        st.write("Players with 3 matches:")
+        st.dataframe(players3_df, width="stretch")
+
+    slot_minutes_map = {
+        t: int(t.split(":")[0]) * 60 + int(t.split(":")[1])
+        for t in TIME_SLOTS
+    }
+
+    gaps = []
+    for player, count in match_counts.items():
+        subset = schedule_df[
+            (schedule_df["player1"] == player)
+            | (schedule_df["player2"] == player)
+        ].sort_values("slot_index")
+        times = subset["slot_time"].tolist()
+        for i in range(len(times) - 1):
+            start_time = times[i]
+            end_time = times[i + 1]
+            gap_minutes = (
+                slot_minutes_map[end_time] - slot_minutes_map[start_time]
+            )
+            gaps.append(
+                {
+                    "player": player,
+                    "first_match": start_time,
+                    "last_match": end_time,
+                    "gap_minutes": gap_minutes,
+                }
+            )
+
+    if gaps:
+        total_gap = sum(g["gap_minutes"] for g in gaps)
+        avg_gap = total_gap / len(gaps)
+        st.write(
+            f"Average time between consecutive matches: {avg_gap:.1f} minutes"
+        )
+
+        gaps_sorted = sorted(gaps, key=lambda g: g["gap_minutes"], reverse=True)
+        top5 = gaps_sorted[:5]
+        st.write("Top 5 largest gaps between consecutive matches (per player):")
+        st.dataframe(pd.DataFrame(top5), width="stretch")
+    else:
+        st.info("Not enough data to compute time between matches.")
 
 
 def main() -> None:
@@ -186,149 +295,63 @@ def main() -> None:
         st.error(f"Error parsing constraints: {parse_error}")
         return
 
-    # Initialize session state for persisted schedule
-    if "schedule_df" not in st.session_state:
-        st.session_state["schedule_df"] = None
+    # Initialize session state for persisted schedules
+    if "phase1_df" not in st.session_state:
+        st.session_state["phase1_df"] = None
+    if "phase2_df" not in st.session_state:
+        st.session_state["phase2_df"] = None
 
-    # Run solver when button is pressed, and store result in session_state
+    # Run solver when button is pressed, and store results in session_state
     if run_button:
         with st.spinner("Running scheduler..."):
             try:
-                st.session_state["schedule_df"] = run_schedule_with_constraints(constraints)
+                phase1_df, phase2_df = run_schedule_with_constraints(constraints)
+                st.session_state["phase1_df"] = phase1_df
+                st.session_state["phase2_df"] = phase2_df
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Scheduler error: {exc}")
-                st.session_state["schedule_df"] = None
+                st.session_state["phase1_df"] = None
+                st.session_state["phase2_df"] = None
 
-    schedule_df = st.session_state.get("schedule_df")
+    phase1_df = st.session_state.get("phase1_df")
+    phase2_df = st.session_state.get("phase2_df")
 
-    if schedule_df is not None and not schedule_df.empty:
-        # Player selector for highlighting
-        players_in_schedule = sorted(
-            set(schedule_df["player1"]).union(schedule_df["player2"])
-        )
+    has_phase1 = phase1_df is not None and not phase1_df.empty
+    has_phase2 = phase2_df is not None and not phase2_df.empty
+
+    if has_phase1 or has_phase2:
+        # Build combined player list for highlighting
+        all_players: set = set()
+        if has_phase1:
+            all_players.update(phase1_df["player1"])
+            all_players.update(phase1_df["player2"])
+        if has_phase2:
+            all_players.update(phase2_df["player1"])
+            all_players.update(phase2_df["player2"])
 
         selected_player = st.selectbox(
             "Highlight matches for player",
-            options=["(none)"] + players_in_schedule,
+            options=["(none)"] + sorted(all_players),
             index=0,
         )
 
-        st.subheader("Schedule")
-        grid = schedule_to_grid(schedule_df)
+        # --- Phase 1 Schedule ---
+        if has_phase1:
+            st.subheader("Phase 1: ELO-Optimal Pairings")
+            grid1 = schedule_to_grid(phase1_df)
+            style_fn1 = _make_style_fn(grid1, selected_player)
+            st.dataframe(grid1.style.apply(style_fn1, axis=0), width="stretch")
 
-        highlight_style = "background-color: #70bf67; font-weight: 600;"
-        border_style = "border-left: 2px solid #999;"
+        # --- Phase 2 Schedule ---
+        if has_phase2:
+            st.subheader("Phase 2: Optimized Placement")
+            grid2 = schedule_to_grid(phase2_df)
+            style_fn2 = _make_style_fn(grid2, selected_player)
+            st.dataframe(grid2.style.apply(style_fn2, axis=0), width="stretch")
 
-        def _style_column(col: pd.Series) -> list[str]:
-            """Return styles for a single column.
-
-            - P2 columns get a left border.
-            - When a player is selected, both players in that match are highlighted.
-            """
-            col_name = col.name
-            is_p2_col = isinstance(col_name, str) and col_name.endswith("P2")
-            styles: list[str] = []
-
-            for idx in col.index:
-                style_parts: List[str] = []
-
-                # Always add a vertical border between P1 and P2 for each table.
-                if is_p2_col:
-                    style_parts.append(border_style)
-
-                # Highlight both players in any match involving the selected player.
-                if selected_player != "(none)" and isinstance(col_name, str) and col_name.startswith("Table "):
-                    try:
-                        # Column format: "Table N P1" or "Table N P2"
-                        parts = col_name.split()
-                        table_number = int(parts[1])
-                        p1_col = f"Table {table_number} P1"
-                        p2_col = f"Table {table_number} P2"
-
-                        p1_val = grid.at[idx, p1_col] if p1_col in grid.columns else ""
-                        p2_val = grid.at[idx, p2_col] if p2_col in grid.columns else ""
-
-                        if p1_val == selected_player or p2_val == selected_player:
-                            style_parts.append(highlight_style)
-                    except (IndexError, ValueError):
-                        # If the column name is not in the expected format, skip highlighting logic.
-                        pass
-
-                styles.append(" ".join(style_parts))
-
-            return styles
-
-        grid_to_show = grid.style.apply(_style_column, axis=0)
-
-        st.dataframe(grid_to_show, width="stretch")
-
-        players_series = pd.concat([schedule_df["player1"], schedule_df["player2"]])
-        match_counts = players_series.value_counts().sort_index()
-        players_with_less_than_2 = match_counts[match_counts < 2]
-        players_with_3 = match_counts[match_counts == 3]
-
-        st.subheader("Schedule verification")
-
-        if players_with_less_than_2.empty:
-            st.success("All players in the schedule have at least 2 matches.")
-        else:
-            st.warning("Some players have fewer than 2 matches.")
-            fewer_df = (
-                players_with_less_than_2
-                .reset_index(name="matches")
-                .rename(columns={"index": "player"})
-            )
-            st.dataframe(fewer_df, width="stretch")
-
-        if not players_with_3.empty:
-            players3_df = (
-                players_with_3
-                .reset_index(name="matches")
-                .rename(columns={"index": "player"})
-            )
-            st.write("Players with 3 matches:")
-            st.dataframe(players3_df, width="stretch")
-
-        gaps = []
-        slot_minutes_map = {
-            t: int(t.split(":")[0]) * 60 + int(t.split(":")[1])
-            for t in TIME_SLOTS
-        }
-
-        for player, count in match_counts.items():
-            subset = schedule_df[
-                (schedule_df["player1"] == player)
-                | (schedule_df["player2"] == player)
-            ].sort_values("slot_index")
-            times = subset["slot_time"].tolist()
-            for i in range(len(times) - 1):
-                start_time = times[i]
-                end_time = times[i + 1]
-                gap_minutes = (
-                    slot_minutes_map[end_time] - slot_minutes_map[start_time]
-                )
-                gaps.append(
-                    {
-                        "player": player,
-                        "first_match": start_time,
-                        "last_match": end_time,
-                        "gap_minutes": gap_minutes,
-                    }
-                )
-
-        if gaps:
-            total_gap = sum(g["gap_minutes"] for g in gaps)
-            avg_gap = total_gap / len(gaps)
-            st.write(
-                f"Average time between consecutive matches: {avg_gap:.1f} minutes"
-            )
-
-            gaps_sorted = sorted(gaps, key=lambda g: g["gap_minutes"], reverse=True)
-            top5 = gaps_sorted[:5]
-            st.write("Top 5 largest gaps between consecutive matches (per player):")
-            st.dataframe(pd.DataFrame(top5), width="stretch")
-        else:
-            st.info("Not enough data to compute time between matches.")
+            # Verification for the final (Phase 2) schedule
+            st.subheader("Schedule verification")
+            _show_verification(phase2_df)
     else:
         st.info("Provide constraints and click 'Run scheduler' in the sidebar.")
 
