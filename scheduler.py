@@ -188,6 +188,7 @@ def _solve_phase1_pairings(
     elo_by_idx: List[float],
     elo_weight: int,
     time_slots: List[str],
+    fairness_weight: int = 100,
 ) -> Tuple[List[Tuple[int, int]], List[Dict[str, Any]]]:
     """Phase 1: Find optimal pairings using ELO objective only.
 
@@ -289,17 +290,50 @@ def _solve_phase1_pairings(
             model.Add(total_var >= min_matches_per_player)
             model.Add(total_var <= max_matches_per_player)
 
-    # --- Objective: ELO only ---
+    # --- Objective: Squared ELO diff + per-player worst-match fairness ---
+
+    # Precompute ELO diff for each pair
+    pair_elo_diff: List[int] = []
+    for m_idx, (i, j) in enumerate(pairs):
+        pair_elo_diff.append(int(abs(elo_by_idx[i] - elo_by_idx[j])))
+
+    # Squared ELO penalty: large mismatches are disproportionately expensive
     terms = []
     for m_idx, (i, j) in enumerate(pairs):
-        elo_diff = int(abs(elo_by_idx[i] - elo_by_idx[j]))
-        if elo_weight * elo_diff <= 0:
+        elo_diff = pair_elo_diff[m_idx]
+        sq_cost = elo_weight * elo_diff * elo_diff
+        if sq_cost <= 0:
             continue
         for s in allowed_slot_indices:
             for k in range(tables_per_slot):
                 v = get_x(m_idx, s, k)
                 if v is not None:
-                    terms.append(elo_weight * elo_diff * v)
+                    terms.append(sq_cost * v)
+
+    # Per-player worst-match penalty: prevents concentrating bad matches
+    # on a single player even when squared diffs handle most cases
+    if fairness_weight > 0:
+        max_elo_range = int(max(elo_by_idx) - min(elo_by_idx)) + 1
+        for p_idx, name_p in enumerate(players):
+            if name_p in omitted_players or name_p in unavailable_players:
+                continue
+            worst_diff = model.NewIntVar(
+                0, max_elo_range, f"p1_worst_diff_{name_p}"
+            )
+            for m_idx, (i, j) in enumerate(pairs):
+                if p_idx not in (i, j):
+                    continue
+                elo_diff = pair_elo_diff[m_idx]
+                if elo_diff == 0:
+                    continue
+                for s in allowed_slot_indices:
+                    for k in range(tables_per_slot):
+                        v = get_x(m_idx, s, k)
+                        if v is not None:
+                            model.Add(
+                                worst_diff >= elo_diff
+                            ).OnlyEnforceIf(v)
+            terms.append(fairness_weight * worst_diff)
 
     if terms:
         model.Minimize(sum(terms))
@@ -822,6 +856,7 @@ def generate_weekly_schedule(
     global_time_window: Optional[tuple[str, str]] = None,
     elo_weight: int = 100,
     table_prefs: Optional[Dict[str, str]] = None,
+    fairness_weight: int = 100,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Two-phase scheduler: ELO-optimal pairings, then compact placement.
 
@@ -953,6 +988,7 @@ def generate_weekly_schedule(
         elo_by_idx=elo_by_idx,
         elo_weight=elo_weight,
         time_slots=time_slots,
+        fairness_weight=fairness_weight,
     )
 
     # ---- Phase 2: Optimize placement ----

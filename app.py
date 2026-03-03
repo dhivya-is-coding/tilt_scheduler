@@ -88,6 +88,7 @@ def run_schedule_with_constraints(
     min_matches = int(constraints.get("min_matches_per_player", 2))
     max_matches = int(constraints.get("max_matches_per_player", 3))
     lookback_weeks = int(constraints.get("lookback_weeks", 3))
+    fairness_weight = int(constraints.get("fairness_weight", 100))
     global_window = constraints.get("global_time_window", ["6:00", "9:45"])
     if isinstance(global_window, (list, tuple)) and len(global_window) == 2:
         global_time_window = (str(global_window[0]), str(global_window[1]))
@@ -117,6 +118,7 @@ def run_schedule_with_constraints(
         lookback_weeks=lookback_weeks,
         global_time_window=global_time_window,
         table_prefs=table_prefs,
+        fairness_weight=fairness_weight,
     )
 
     return pd.DataFrame(phase1_records), pd.DataFrame(phase2_records)
