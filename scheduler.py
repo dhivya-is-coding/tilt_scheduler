@@ -1,4 +1,5 @@
 import bisect
+import random
 from typing import List, Dict, Set, Optional, Any, Tuple
 import pandas as pd
 from ortools.sat.python import cp_model
@@ -526,114 +527,10 @@ def _solve_phase2_placement(
         )
         match_valid_slots[m_idx] = valid
 
-    # --- Mutable state ---
-    unplaced: Set[int] = set(range(num_matches))
-
-    # player_in_slot[s] = set of player indices already booked in slot s
-    player_in_slot: Dict[int, Set[int]] = {s: set() for s in sorted_slots}
-    # slot_table_count[s] = number of tables used in slot s
-    slot_table_count: Dict[int, int] = {s: 0 for s in sorted_slots}
-    # player_slots[player_idx] = sorted list of slots where player is placed
-    player_slots: Dict[int, List[int]] = {}
-
     # Resolved table prefs (0-indexed sets); empty dict if none
     prefs = player_table_prefs or {}
-    # slot_match_recs[s] = list of schedule dicts placed in slot s
-    # (used for table-feasibility checks during greedy placement)
-    slot_match_recs: Dict[int, List[Dict[str, Any]]] = {s: [] for s in sorted_slots}
 
-    schedule: List[Dict[str, Any]] = []
-
-    # Iteratively place matches one at a time, always picking the globally
-    # best (match, slot) combination.
-    while unplaced:
-        best_score = -float("inf")
-        best_match: Optional[int] = None
-        best_slot: Optional[int] = None
-
-        for m_idx in unplaced:
-            i, j = fixed_matches[m_idx]
-
-            for s in match_valid_slots[m_idx]:
-                # Hard constraint: table capacity
-                if slot_table_count[s] >= tables_per_slot:
-                    continue
-                # Hard constraint: no double-booking
-                if i in player_in_slot[s] or j in player_in_slot[s]:
-                    continue
-
-                # Hard constraint: table preferences must be satisfiable
-                if prefs:
-                    hypo = slot_match_recs[s] + [
-                        {"player1": players[i], "player2": players[j], "table": 0}
-                    ]
-                    if not _can_assign_tables(hypo, tables_per_slot, prefs):
-                        continue
-
-                # --- Scoring ---
-                adjacency = 0
-                total_gap = 0
-                has_anchor = False
-                for p_idx in (i, j):
-                    placed = player_slots.get(p_idx)
-                    if not placed:
-                        continue
-                    has_anchor = True
-                    min_dist = min(abs(s - ps) for ps in placed)
-                    if min_dist == 1:
-                        adjacency += 1  # back-to-back
-                    total_gap += min_dist
-
-                # Urgency: how constrained is this match?
-                open_slots = 0
-                for vs in match_valid_slots[m_idx]:
-                    if slot_table_count[vs] < tables_per_slot:
-                        if i not in player_in_slot[vs] and j not in player_in_slot[vs]:
-                            open_slots += 1
-                urgency = 1.0 / max(open_slots, 1)
-
-                earliness = -s
-
-                score = (
-                    adjacency * 100000.0
-                    - total_gap * 1000.0
-                    + urgency * 500.0
-                    + earliness * 1.0
-                )
-
-                if score > best_score:
-                    best_score = score
-                    best_match = m_idx
-                    best_slot = s
-
-        if best_match is None:
-            break
-
-        # Place best_match in best_slot
-        i_best, j_best = fixed_matches[best_match]
-        player_in_slot[best_slot].add(i_best)
-        player_in_slot[best_slot].add(j_best)
-        slot_table_count[best_slot] += 1
-        for p_idx in (i_best, j_best):
-            if p_idx not in player_slots:
-                player_slots[p_idx] = [best_slot]
-            else:
-                bisect.insort(player_slots[p_idx], best_slot)
-
-        rec = {
-            "slot_index": best_slot,
-            "slot_time": time_slots[best_slot],
-            "table": slot_table_count[best_slot] - 1,
-            "player1": players[i_best],
-            "player2": players[j_best],
-        }
-        schedule.append(rec)
-        slot_match_recs[best_slot].append(rec)
-        unplaced.remove(best_match)
-
-    # --- Post-processing: local search to reduce gaps ---
-    # Try swapping slot assignments between pairs of matches to reduce
-    # the total gap across all players.
+    # --- Helper functions for local search ---
     def _total_player_gap(sched: List[Dict[str, Any]]) -> float:
         """Weighted sum of all consecutive gaps (in slot indices) for all players.
 
@@ -712,109 +609,315 @@ def _solve_phase2_placement(
 
         return True
 
-    # Run local-search passes (swap + relocate)
-    for _pass in range(10):
-        improved = False
-        current_gap = _total_player_gap(schedule)
+    def _try_relocate_match(
+        sched: List[Dict[str, Any]], idx_m: int,
+        slot_occ: Dict[int, int], slot_players_map: Dict[int, Set[str]],
+    ) -> Optional[Tuple[int, float]]:
+        """Find the best slot to relocate sched[idx_m] to.
 
-        # --- Swap: exchange slot assignments of two matches ---
-        for idx_a in range(len(schedule)):
-            for idx_b in range(idx_a + 1, len(schedule)):
-                if not _is_valid_swap(schedule, idx_a, idx_b):
+        Returns (best_slot, best_gap) if an improving move exists, else None.
+        Non-mutating: reverts all trial moves.
+        """
+        rec = sched[idx_m]
+        old_s = rec["slot_index"]
+        old_time = rec["slot_time"]
+        p1_name, p2_name = rec["player1"], rec["player2"]
+
+        best_new_s: Optional[int] = None
+        best_gap = _total_player_gap(sched)
+
+        for new_s in sorted_slots:
+            if new_s == old_s:
+                continue
+            if slot_occ[new_s] >= tables_per_slot:
+                continue
+            if new_s not in player_slot_set.get(p1_name, set()):
+                continue
+            if new_s not in player_slot_set.get(p2_name, set()):
+                continue
+            new_slot_ps = slot_players_map[new_s]
+            if p1_name in new_slot_ps or p2_name in new_slot_ps:
+                continue
+
+            if prefs:
+                hypo = [
+                    r for r in sched
+                    if r["slot_index"] == new_s and r is not rec
+                ] + [rec]
+                if not _can_assign_tables(hypo, tables_per_slot, prefs):
                     continue
 
-                old_slot_a = schedule[idx_a]["slot_index"]
-                old_time_a = schedule[idx_a]["slot_time"]
-                old_slot_b = schedule[idx_b]["slot_index"]
-                old_time_b = schedule[idx_b]["slot_time"]
+            rec["slot_index"] = new_s
+            rec["slot_time"] = time_slots[new_s]
 
-                schedule[idx_a]["slot_index"] = old_slot_b
-                schedule[idx_a]["slot_time"] = old_time_b
-                schedule[idx_b]["slot_index"] = old_slot_a
-                schedule[idx_b]["slot_time"] = old_time_a
+            new_gap = _total_player_gap(sched)
+            if new_gap < best_gap:
+                best_new_s = new_s
+                best_gap = new_gap
 
-                new_gap = _total_player_gap(schedule)
-                if new_gap < current_gap:
-                    current_gap = new_gap
-                    improved = True
-                else:
-                    schedule[idx_a]["slot_index"] = old_slot_a
-                    schedule[idx_a]["slot_time"] = old_time_a
-                    schedule[idx_b]["slot_index"] = old_slot_b
-                    schedule[idx_b]["slot_time"] = old_time_b
+            rec["slot_index"] = old_s
+            rec["slot_time"] = old_time
 
-        # --- Relocate: move a match to a different slot ---
-        # Build current slot occupancy
-        slot_occ: Dict[int, int] = {s: 0 for s in sorted_slots}
-        slot_players: Dict[int, Set[str]] = {s: set() for s in sorted_slots}
-        for rec in schedule:
-            s = rec["slot_index"]
-            slot_occ[s] += 1
-            slot_players[s].add(rec["player1"])
-            slot_players[s].add(rec["player2"])
+        if best_new_s is not None:
+            return (best_new_s, best_gap)
+        return None
 
-        for idx_m in range(len(schedule)):
-            rec = schedule[idx_m]
-            old_s = rec["slot_index"]
-            p1_name, p2_name = rec["player1"], rec["player2"]
+    # --- Multiple random restarts ---
+    NUM_RESTARTS = 5
+    rng = random.Random(42)
+    best_schedule: Optional[List[Dict[str, Any]]] = None
+    best_total_gap = float("inf")
 
-            for new_s in sorted_slots:
-                if new_s == old_s:
+    for restart in range(NUM_RESTARTS):
+        # Determine match iteration order for tie-breaking
+        match_order = list(range(num_matches))
+        if restart > 0:
+            rng.shuffle(match_order)
+
+        # --- Mutable state ---
+        unplaced: Set[int] = set(range(num_matches))
+        player_in_slot: Dict[int, Set[int]] = {s: set() for s in sorted_slots}
+        slot_table_count: Dict[int, int] = {s: 0 for s in sorted_slots}
+        player_slots: Dict[int, List[int]] = {}
+        slot_match_recs: Dict[int, List[Dict[str, Any]]] = {s: [] for s in sorted_slots}
+        schedule: List[Dict[str, Any]] = []
+
+        # Greedy placement: iterate in match_order for tie-breaking
+        while unplaced:
+            best_score = -float("inf")
+            best_match: Optional[int] = None
+            best_slot: Optional[int] = None
+
+            for m_idx in match_order:
+                if m_idx not in unplaced:
                     continue
-                # Capacity check: new slot must have room
-                if slot_occ[new_s] >= tables_per_slot:
-                    continue
-                # Availability check
-                if new_s not in player_slot_set.get(p1_name, set()):
-                    continue
-                if new_s not in player_slot_set.get(p2_name, set()):
-                    continue
-                # Double-booking: neither player in new slot already
-                # (must exclude self from old slot)
-                new_slot_ps = set(slot_players[new_s])
-                if p1_name in new_slot_ps or p2_name in new_slot_ps:
-                    continue
+                i, j = fixed_matches[m_idx]
 
-                # Table preference feasibility for destination slot
-                if prefs:
-                    hypo = [
-                        r for r in schedule
-                        if r["slot_index"] == new_s and r is not rec
-                    ] + [rec]
-                    if not _can_assign_tables(hypo, tables_per_slot, prefs):
+                for s in match_valid_slots[m_idx]:
+                    # Hard constraint: table capacity
+                    if slot_table_count[s] >= tables_per_slot:
+                        continue
+                    # Hard constraint: no double-booking
+                    if i in player_in_slot[s] or j in player_in_slot[s]:
                         continue
 
-                # Try the move
-                old_time = rec["slot_time"]
-                rec["slot_index"] = new_s
-                rec["slot_time"] = time_slots[new_s]
+                    # Hard constraint: table preferences must be satisfiable
+                    if prefs:
+                        hypo = slot_match_recs[s] + [
+                            {"player1": players[i], "player2": players[j], "table": 0}
+                        ]
+                        if not _can_assign_tables(hypo, tables_per_slot, prefs):
+                            continue
 
-                new_gap = _total_player_gap(schedule)
-                if new_gap < current_gap:
-                    # Accept: update occupancy
+                    # --- Scoring ---
+                    adjacency = 0
+                    total_gap = 0
+                    for p_idx in (i, j):
+                        placed = player_slots.get(p_idx)
+                        if not placed:
+                            continue
+                        min_dist = min(abs(s - ps) for ps in placed)
+                        if min_dist == 1:
+                            adjacency += 1  # back-to-back
+                        total_gap += min_dist
+
+                    # Urgency: how constrained is this match?
+                    open_slots = 0
+                    for vs in match_valid_slots[m_idx]:
+                        if slot_table_count[vs] < tables_per_slot:
+                            if i not in player_in_slot[vs] and j not in player_in_slot[vs]:
+                                open_slots += 1
+                    urgency = 1.0 / max(open_slots, 1)
+
+                    earliness = -s
+
+                    score = (
+                        adjacency * 100000.0
+                        - total_gap * 1000.0
+                        + urgency * 500.0
+                        + earliness * 1.0
+                    )
+
+                    # Small random perturbation for tie-breaking on restarts > 0
+                    if restart > 0:
+                        score += rng.random() * 0.1
+
+                    if score > best_score:
+                        best_score = score
+                        best_match = m_idx
+                        best_slot = s
+
+            if best_match is None:
+                break
+
+            # Place best_match in best_slot
+            i_best, j_best = fixed_matches[best_match]
+            player_in_slot[best_slot].add(i_best)
+            player_in_slot[best_slot].add(j_best)
+            slot_table_count[best_slot] += 1
+            for p_idx in (i_best, j_best):
+                if p_idx not in player_slots:
+                    player_slots[p_idx] = [best_slot]
+                else:
+                    bisect.insort(player_slots[p_idx], best_slot)
+
+            rec = {
+                "slot_index": best_slot,
+                "slot_time": time_slots[best_slot],
+                "table": slot_table_count[best_slot] - 1,
+                "player1": players[i_best],
+                "player2": players[j_best],
+            }
+            schedule.append(rec)
+            slot_match_recs[best_slot].append(rec)
+            unplaced.remove(best_match)
+
+        # Skip this restart if not all matches were placed
+        if unplaced:
+            continue
+
+        # --- Local search passes (swap + relocate) ---
+        for _pass in range(10):
+            improved = False
+            current_gap = _total_player_gap(schedule)
+
+            # --- Swap: exchange slot assignments of two matches ---
+            for idx_a in range(len(schedule)):
+                for idx_b in range(idx_a + 1, len(schedule)):
+                    if not _is_valid_swap(schedule, idx_a, idx_b):
+                        continue
+
+                    old_slot_a = schedule[idx_a]["slot_index"]
+                    old_time_a = schedule[idx_a]["slot_time"]
+                    old_slot_b = schedule[idx_b]["slot_index"]
+                    old_time_b = schedule[idx_b]["slot_time"]
+
+                    schedule[idx_a]["slot_index"] = old_slot_b
+                    schedule[idx_a]["slot_time"] = old_time_b
+                    schedule[idx_b]["slot_index"] = old_slot_a
+                    schedule[idx_b]["slot_time"] = old_time_a
+
+                    new_gap = _total_player_gap(schedule)
+                    if new_gap < current_gap:
+                        current_gap = new_gap
+                        improved = True
+                    else:
+                        schedule[idx_a]["slot_index"] = old_slot_a
+                        schedule[idx_a]["slot_time"] = old_time_a
+                        schedule[idx_b]["slot_index"] = old_slot_b
+                        schedule[idx_b]["slot_time"] = old_time_b
+
+            # --- Relocate: move a match to a different slot (best-improvement) ---
+            slot_occ: Dict[int, int] = {s: 0 for s in sorted_slots}
+            slot_players: Dict[int, Set[str]] = {s: set() for s in sorted_slots}
+            for rec in schedule:
+                s = rec["slot_index"]
+                slot_occ[s] += 1
+                slot_players[s].add(rec["player1"])
+                slot_players[s].add(rec["player2"])
+
+            for idx_m in range(len(schedule)):
+                result = _try_relocate_match(schedule, idx_m, slot_occ, slot_players)
+                if result is not None:
+                    best_new_s, best_gap = result
+                    rec = schedule[idx_m]
+                    old_s = rec["slot_index"]
+                    p1_name, p2_name = rec["player1"], rec["player2"]
+                    rec["slot_index"] = best_new_s
+                    rec["slot_time"] = time_slots[best_new_s]
                     slot_occ[old_s] -= 1
                     slot_players[old_s].discard(p1_name)
                     slot_players[old_s].discard(p2_name)
-                    slot_occ[new_s] += 1
-                    slot_players[new_s].add(p1_name)
-                    slot_players[new_s].add(p2_name)
-                    current_gap = new_gap
+                    slot_occ[best_new_s] += 1
+                    slot_players[best_new_s].add(p1_name)
+                    slot_players[best_new_s].add(p2_name)
+                    current_gap = best_gap
                     improved = True
-                    break  # restart search for this match
-                else:
-                    rec["slot_index"] = old_s
-                    rec["slot_time"] = old_time
 
-        if not improved:
-            break
+            if not improved:
+                break
 
-    if unplaced:
+        # Track best result across restarts
+        gap = _total_player_gap(schedule)
+        if gap < best_total_gap:
+            best_total_gap = gap
+            best_schedule = [dict(r) for r in schedule]
+
+    if best_schedule is None:
         raise RuntimeError(
-            f"Phase 2 greedy: {len(unplaced)} match(es) could not be placed."
+            f"Phase 2 greedy: no restart could place all {num_matches} match(es)."
         )
 
+    schedule = best_schedule
+
+    # --- Player-targeted compaction pass ---
+    # After best restart is selected, directly target players with worst gaps
+    for _compact_pass in range(3):
+        compact_improved = False
+
+        # Compute per-player gap scores
+        p_slots_map: Dict[str, List[int]] = {}
+        for rec in schedule:
+            for key in ("player1", "player2"):
+                p_slots_map.setdefault(rec[key], []).append(rec["slot_index"])
+
+        player_gap_scores: List[Tuple[float, str]] = []
+        for player, slots_list in p_slots_map.items():
+            if len(slots_list) < 2:
+                continue
+            slots_list.sort()
+            gap_score = sum(
+                (slots_list[k + 1] - slots_list[k]) ** 2
+                for k in range(len(slots_list) - 1)
+            )
+            player_gap_scores.append((gap_score, player))
+
+        # Target top-5 worst-gap players
+        player_gap_scores.sort(reverse=True)
+        for _, target_player in player_gap_scores[:5]:
+            target_slots = sorted(p_slots_map[target_player])
+            if len(target_slots) < 2:
+                continue
+
+            # Find the "outlier" match — furthest from cluster median
+            median_slot = target_slots[len(target_slots) // 2]
+            outlier_idx: Optional[int] = None
+            outlier_dist = -1
+            for idx_m, rec in enumerate(schedule):
+                if rec["player1"] != target_player and rec["player2"] != target_player:
+                    continue
+                dist = abs(rec["slot_index"] - median_slot)
+                if dist > outlier_dist:
+                    outlier_dist = dist
+                    outlier_idx = idx_m
+
+            if outlier_idx is None:
+                continue
+
+            # Build occupancy for relocate attempt
+            slot_occ_c: Dict[int, int] = {s: 0 for s in sorted_slots}
+            slot_players_c: Dict[int, Set[str]] = {s: set() for s in sorted_slots}
+            for rec in schedule:
+                s = rec["slot_index"]
+                slot_occ_c[s] += 1
+                slot_players_c[s].add(rec["player1"])
+                slot_players_c[s].add(rec["player2"])
+
+            result = _try_relocate_match(
+                schedule, outlier_idx, slot_occ_c, slot_players_c,
+            )
+            if result is not None:
+                best_new_s, best_gap = result
+                rec = schedule[outlier_idx]
+                old_s = rec["slot_index"]
+                rec["slot_index"] = best_new_s
+                rec["slot_time"] = time_slots[best_new_s]
+                compact_improved = True
+
+        if not compact_improved:
+            break
+
     # Reassign table numbers within each slot, respecting table preferences
-    prefs = player_table_prefs or {}
     schedule.sort(key=lambda r: (r["slot_index"], r["table"]))
 
     # Group matches by slot
@@ -834,6 +937,207 @@ def _solve_phase2_placement(
             for idx, rec in enumerate(matches_in_slot):
                 rec["table"] = idx
 
+    return schedule
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (CP-SAT): Optimal gap minimization for fixed matches
+# ---------------------------------------------------------------------------
+
+def _solve_phase2_cpsat(
+    fixed_matches: List[Tuple[int, int]],
+    players: List[str],
+    allowed_slot_indices: List[int],
+    player_allowed_slots: Dict[str, List[int]],
+    tables_per_slot: int,
+    omitted_players: Set[str],
+    unavailable_players: Set[str],
+    time_slots: List[str],
+    player_table_prefs: Optional[Dict[str, Set[int]]] = None,
+) -> List[Dict[str, Any]]:
+    """Phase 2 (CP-SAT): Optimally assign fixed matches to (slot, table) pairs.
+
+    Uses the same CP-SAT solver as Phase 1 to find provably optimal
+    slot/table assignments that minimize the sum of squared consecutive
+    gaps per player.
+
+    Returns the schedule as a list of dicts, or raises RuntimeError on failure.
+    """
+    num_matches = len(fixed_matches)
+    if num_matches == 0:
+        return []
+
+    prefs = player_table_prefs or {}
+    all_tables = set(range(tables_per_slot))
+    sorted_slots = sorted(allowed_slot_indices)
+
+    # Precompute per-player allowed slot sets
+    player_slot_set: Dict[str, Set[int]] = {
+        p: set(slots) for p, slots in player_allowed_slots.items()
+    }
+
+    # Build per-player match lists (indices into fixed_matches)
+    player_matches: Dict[int, List[int]] = {}
+    for m_idx, (i, j) in enumerate(fixed_matches):
+        player_matches.setdefault(i, []).append(m_idx)
+        player_matches.setdefault(j, []).append(m_idx)
+
+    model = cp_model.CpModel()
+
+    # Decision variables y[m, s, k] — match m assigned to slot s, table k
+    y: Dict[Tuple[int, int, int], cp_model.IntVar] = {}
+    for m_idx, (i, j) in enumerate(fixed_matches):
+        name_i = players[i]
+        name_j = players[j]
+        # Tables allowed for this match (intersection of both players' prefs)
+        tables_i = prefs.get(name_i, all_tables)
+        tables_j = prefs.get(name_j, all_tables)
+        allowed_tables = tables_i & tables_j
+        if not allowed_tables:
+            allowed_tables = all_tables  # fallback if intersection is empty
+
+        for s in sorted_slots:
+            # Both players must be available in this slot
+            if s not in player_slot_set.get(name_i, set()):
+                continue
+            if s not in player_slot_set.get(name_j, set()):
+                continue
+            for k in sorted(allowed_tables):
+                y[(m_idx, s, k)] = model.NewBoolVar(f"y_m{m_idx}_s{s}_k{k}")
+
+    # --- Hard Constraints ---
+
+    # 1) Each match assigned exactly once
+    for m_idx in range(num_matches):
+        vars_for_match = [
+            y[(m_idx, s, k)]
+            for s in sorted_slots
+            for k in range(tables_per_slot)
+            if (m_idx, s, k) in y
+        ]
+        if not vars_for_match:
+            raise RuntimeError(
+                f"Phase 2 CP-SAT: match {m_idx} has no feasible (slot, table) options."
+            )
+        model.Add(sum(vars_for_match) == 1)
+
+    # 2) At most one match per (slot, table)
+    for s in sorted_slots:
+        for k in range(tables_per_slot):
+            vars_here = [
+                y[(m_idx, s, k)]
+                for m_idx in range(num_matches)
+                if (m_idx, s, k) in y
+            ]
+            if len(vars_here) > 1:
+                model.Add(sum(vars_here) <= 1)
+
+    # 3) No double-booking: for each player and slot, at most one match active
+    for p_idx in player_matches:
+        name_p = players[p_idx]
+        for s in sorted_slots:
+            if s not in player_slot_set.get(name_p, set()):
+                continue
+            vars_here = []
+            for m_idx in player_matches[p_idx]:
+                for k in range(tables_per_slot):
+                    if (m_idx, s, k) in y:
+                        vars_here.append(y[(m_idx, s, k)])
+            if len(vars_here) > 1:
+                model.Add(sum(vars_here) <= 1)
+
+    # --- Derive slot_of[m] for each match ---
+    min_slot = sorted_slots[0] if sorted_slots else 0
+    max_slot = sorted_slots[-1] if sorted_slots else 0
+
+    slot_of: Dict[int, cp_model.IntVar] = {}
+    for m_idx in range(num_matches):
+        slot_var = model.NewIntVar(min_slot, max_slot, f"slot_m{m_idx}")
+        model.Add(
+            slot_var == sum(
+                s * y[(m_idx, s, k)]
+                for s in sorted_slots
+                for k in range(tables_per_slot)
+                if (m_idx, s, k) in y
+            )
+        )
+        slot_of[m_idx] = slot_var
+
+    # --- Objective: minimize sum of squared consecutive gaps per player ---
+    obj_terms = []
+
+    for p_idx, match_list in player_matches.items():
+        n_matches = len(match_list)
+        if n_matches < 2:
+            continue
+
+        if n_matches == 2:
+            m1, m2 = match_list
+            span = max_slot - min_slot
+            diff = model.NewIntVar(-span, span, f"diff_p{p_idx}")
+            abs_diff = model.NewIntVar(0, span, f"absdiff_p{p_idx}")
+            model.Add(diff == slot_of[m1] - slot_of[m2])
+            model.AddAbsEquality(abs_diff, diff)
+            sq = model.NewIntVar(0, span * span, f"sq_p{p_idx}")
+            model.AddMultiplicationEquality(sq, abs_diff, abs_diff)
+            obj_terms.append(sq)
+
+        elif n_matches == 3:
+            m1, m2, m3 = match_list
+            s1, s2, s3 = slot_of[m1], slot_of[m2], slot_of[m3]
+
+            min_s = model.NewIntVar(min_slot, max_slot, f"min_p{p_idx}")
+            max_s = model.NewIntVar(min_slot, max_slot, f"max_p{p_idx}")
+            model.AddMinEquality(min_s, [s1, s2, s3])
+            model.AddMaxEquality(max_s, [s1, s2, s3])
+
+            # mid = s1 + s2 + s3 - min - max
+            total = model.NewIntVar(3 * min_slot, 3 * max_slot, f"total_p{p_idx}")
+            model.Add(total == s1 + s2 + s3)
+            mid_s = model.NewIntVar(min_slot, max_slot, f"mid_p{p_idx}")
+            model.Add(mid_s == total - min_s - max_s)
+
+            gap1 = model.NewIntVar(0, max_slot - min_slot, f"gap1_p{p_idx}")
+            model.Add(gap1 == mid_s - min_s)
+            gap2 = model.NewIntVar(0, max_slot - min_slot, f"gap2_p{p_idx}")
+            model.Add(gap2 == max_s - mid_s)
+
+            sq1 = model.NewIntVar(0, (max_slot - min_slot) ** 2, f"sq1_p{p_idx}")
+            sq2 = model.NewIntVar(0, (max_slot - min_slot) ** 2, f"sq2_p{p_idx}")
+            model.AddMultiplicationEquality(sq1, gap1, gap1)
+            model.AddMultiplicationEquality(sq2, gap2, gap2)
+            obj_terms.append(sq1)
+            obj_terms.append(sq2)
+
+    if obj_terms:
+        model.Minimize(sum(obj_terms))
+    else:
+        model.Minimize(0)
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30.0
+
+    status = solver.Solve(model)
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError(
+            f"Phase 2 CP-SAT: no feasible placement found (status={status})."
+        )
+
+    # Extract schedule
+    schedule: List[Dict[str, Any]] = []
+    for m_idx, (i, j) in enumerate(fixed_matches):
+        for s in sorted_slots:
+            for k in range(tables_per_slot):
+                if (m_idx, s, k) in y and solver.Value(y[(m_idx, s, k)]) == 1:
+                    schedule.append({
+                        "slot_index": s,
+                        "slot_time": time_slots[s],
+                        "table": k,
+                        "player1": players[i],
+                        "player2": players[j],
+                    })
+
+    schedule.sort(key=lambda r: (r["slot_index"], r["table"]))
     return schedule
 
 
@@ -992,8 +1296,10 @@ def generate_weekly_schedule(
     )
 
     # ---- Phase 2: Optimize placement ----
+    # Try CP-SAT optimal placement first, fall back to greedy, then Phase 1
+    phase2_schedule = None
     try:
-        phase2_schedule = _solve_phase2_placement(
+        phase2_schedule = _solve_phase2_cpsat(
             fixed_matches=selected_pairs,
             players=players,
             allowed_slot_indices=allowed_slot_indices,
@@ -1005,7 +1311,23 @@ def generate_weekly_schedule(
             player_table_prefs=player_table_prefs,
         )
     except RuntimeError:
-        # Fallback: use Phase 1's slot assignments if Phase 2 fails
-        phase2_schedule = phase1_schedule
+        pass
+
+    if phase2_schedule is None:
+        try:
+            phase2_schedule = _solve_phase2_placement(
+                fixed_matches=selected_pairs,
+                players=players,
+                allowed_slot_indices=allowed_slot_indices,
+                player_allowed_slots=player_allowed_slots,
+                tables_per_slot=tables_per_slot,
+                omitted_players=omitted_players,
+                unavailable_players=unavailable_players,
+                time_slots=time_slots,
+                player_table_prefs=player_table_prefs,
+            )
+        except RuntimeError:
+            # Fallback: use Phase 1's slot assignments if both Phase 2 solvers fail
+            phase2_schedule = phase1_schedule
 
     return phase1_schedule, phase2_schedule
