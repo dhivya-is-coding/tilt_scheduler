@@ -1,5 +1,6 @@
 import json
 import ast
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -74,10 +75,12 @@ def load_constraints_from_file(path: Path) -> Dict[str, Any]:
 
 def run_schedule_with_constraints(
     constraints: Dict[str, Any],
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Run the scheduler and return (phase1_df, phase2_df)."""
-    # Load league data from Google Sheet via loader.py
-    matches_df, elos_df = ld.extract_by_weektags_and_final_elos(ld.df)
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Run the scheduler and return (phase1_df, phase2_df, fetch_timestamp)."""
+    # Re-fetch from Google Sheet each run so the week number is always current.
+    fresh_df = pd.read_csv(ld.url)
+    fetch_time = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    matches_df, elos_df = ld.extract_by_weektags_and_final_elos(fresh_df)
     players = elos_df["player"].tolist()
     elos = dict(zip(elos_df["player"], elos_df["elo"]))
 
@@ -121,7 +124,7 @@ def run_schedule_with_constraints(
         fairness_weight=fairness_weight,
     )
 
-    return pd.DataFrame(phase1_records), pd.DataFrame(phase2_records)
+    return pd.DataFrame(phase1_records), pd.DataFrame(phase2_records), fetch_time
 
 
 def schedule_to_grid(schedule_df: pd.DataFrame) -> pd.DataFrame:
@@ -304,18 +307,25 @@ def main() -> None:
         st.session_state["phase1_df"] = None
     if "phase2_df" not in st.session_state:
         st.session_state["phase2_df"] = None
+    if "last_fetch_time" not in st.session_state:
+        st.session_state["last_fetch_time"] = None
 
     # Run solver when button is pressed, and store results in session_state
     if run_button:
         with st.spinner("Running scheduler..."):
             try:
-                phase1_df, phase2_df = run_schedule_with_constraints(constraints)
+                phase1_df, phase2_df, fetch_time = run_schedule_with_constraints(constraints)
                 st.session_state["phase1_df"] = phase1_df
                 st.session_state["phase2_df"] = phase2_df
+                st.session_state["last_fetch_time"] = fetch_time
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Scheduler error: {exc}")
                 st.session_state["phase1_df"] = None
                 st.session_state["phase2_df"] = None
+                st.session_state["last_fetch_time"] = None
+
+    if st.session_state.get("last_fetch_time"):
+        st.caption(f"Last data pull from Google Sheet: {st.session_state['last_fetch_time']}")
 
     phase1_df = st.session_state.get("phase1_df")
     phase2_df = st.session_state.get("phase2_df")

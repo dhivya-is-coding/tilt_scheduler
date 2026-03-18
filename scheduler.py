@@ -549,6 +549,19 @@ def _solve_phase2_placement(
                 total += gap * gap  # squared: big gaps penalised more
         return total
 
+    def _combined_objective(sched: List[Dict[str, Any]]) -> float:
+        """Per-player gap + slot-sum penalty.
+
+        Adding sum(slot_index) * SLOT_WEIGHT pushes every local-search pass
+        to prefer earlier placements, compacting the overall schedule, while
+        still respecting back-to-back adjacency (which carries a 100000 bonus
+        in the greedy and dominates the per-player gap term).
+        """
+        SLOT_WEIGHT = 2.0
+        gap = _total_player_gap(sched)
+        slot_sum = sum(r["slot_index"] for r in sched) if sched else 0.0
+        return gap + slot_sum * SLOT_WEIGHT
+
     def _is_valid_swap(
         sched: List[Dict[str, Any]], idx_a: int, idx_b: int,
     ) -> bool:
@@ -624,7 +637,7 @@ def _solve_phase2_placement(
         p1_name, p2_name = rec["player1"], rec["player2"]
 
         best_new_s: Optional[int] = None
-        best_gap = _total_player_gap(sched)
+        best_gap = _combined_objective(sched)
 
         for new_s in sorted_slots:
             if new_s == old_s:
@@ -650,7 +663,7 @@ def _solve_phase2_placement(
             rec["slot_index"] = new_s
             rec["slot_time"] = time_slots[new_s]
 
-            new_gap = _total_player_gap(sched)
+            new_gap = _combined_objective(sched)
             if new_gap < best_gap:
                 best_new_s = new_s
                 best_gap = new_gap
@@ -729,13 +742,16 @@ def _solve_phase2_placement(
                                 open_slots += 1
                     urgency = 1.0 / max(open_slots, 1)
 
-                    earliness = -s
+                    # Strong earliness: weight 1000 keeps back-to-back adjacency
+                    # dominant (100000) while making early slots decisively
+                    # preferred over late slots when adjacency is equal.
+                    earliness = -s * 1000.0
 
                     score = (
                         adjacency * 100000.0
                         - total_gap * 1000.0
                         + urgency * 500.0
-                        + earliness * 1.0
+                        + earliness
                     )
 
                     # Small random perturbation for tie-breaking on restarts > 0
@@ -779,7 +795,7 @@ def _solve_phase2_placement(
         # --- Local search passes (swap + relocate) ---
         for _pass in range(10):
             improved = False
-            current_gap = _total_player_gap(schedule)
+            current_gap = _combined_objective(schedule)
 
             # --- Swap: exchange slot assignments of two matches ---
             for idx_a in range(len(schedule)):
@@ -797,7 +813,7 @@ def _solve_phase2_placement(
                     schedule[idx_b]["slot_index"] = old_slot_a
                     schedule[idx_b]["slot_time"] = old_time_a
 
-                    new_gap = _total_player_gap(schedule)
+                    new_gap = _combined_objective(schedule)
                     if new_gap < current_gap:
                         current_gap = new_gap
                         improved = True
@@ -838,7 +854,7 @@ def _solve_phase2_placement(
                 break
 
         # Track best result across restarts
-        gap = _total_player_gap(schedule)
+        gap = _combined_objective(schedule)
         if gap < best_total_gap:
             best_total_gap = gap
             best_schedule = [dict(r) for r in schedule]
@@ -916,6 +932,76 @@ def _solve_phase2_placement(
 
         if not compact_improved:
             break
+
+    # --- Global slot-compaction pass ---
+    # Fill completely empty slots by relocating a match from any later slot.
+    # Enforces: no slot is empty while a later slot is occupied.
+    # Availability and double-booking are respected; table prefs are checked.
+    for _gcpass in range(50):
+        # Build slot occupancy snapshot
+        slot_uses_gc: Dict[int, int] = {s: 0 for s in sorted_slots}
+        for rec in schedule:
+            slot_uses_gc[rec["slot_index"]] += 1
+
+        occupied_gc = [s for s in sorted_slots if slot_uses_gc[s] > 0]
+        if not occupied_gc:
+            break
+        last_used_gc = max(occupied_gc)
+
+        # Find the earliest completely empty slot before last_used_gc
+        gap_slots_gc = [
+            s for s in sorted_slots
+            if slot_uses_gc[s] == 0 and s < last_used_gc
+        ]
+        if not gap_slots_gc:
+            break  # No gaps remain
+
+        target_gc = gap_slots_gc[0]
+
+        # Try to move a match from a later occupied slot to target_gc
+        moved_gc = False
+        for src_s in sorted_slots:
+            if src_s <= target_gc:
+                continue
+            if slot_uses_gc[src_s] == 0:
+                continue
+
+            players_at_target: Set[str] = set()
+            for rec in schedule:
+                if rec["slot_index"] == target_gc:
+                    players_at_target.add(rec["player1"])
+                    players_at_target.add(rec["player2"])
+
+            for rec in schedule:
+                if rec["slot_index"] != src_s:
+                    continue
+
+                p1_n, p2_n = rec["player1"], rec["player2"]
+
+                if target_gc not in player_slot_set.get(p1_n, set()):
+                    continue
+                if target_gc not in player_slot_set.get(p2_n, set()):
+                    continue
+                if p1_n in players_at_target or p2_n in players_at_target:
+                    continue
+
+                if prefs:
+                    hypo = [
+                        r for r in schedule if r["slot_index"] == target_gc
+                    ] + [{"player1": p1_n, "player2": p2_n, "table": 0}]
+                    if not _can_assign_tables(hypo, tables_per_slot, prefs):
+                        continue
+
+                rec["slot_index"] = target_gc
+                rec["slot_time"] = time_slots[target_gc]
+                moved_gc = True
+                break
+
+            if moved_gc:
+                break
+
+        if not moved_gc:
+            break  # Gap can't be filled — accept it
 
     # Reassign table numbers within each slot, respecting table preferences
     schedule.sort(key=lambda r: (r["slot_index"], r["table"]))
@@ -1064,6 +1150,9 @@ def _solve_phase2_cpsat(
         slot_of[m_idx] = slot_var
 
     # --- Objective: minimize sum of squared consecutive gaps per player ---
+    # Gap terms are scaled by GAP_WEIGHT so they always dominate the
+    # earliness tiebreaker (weight 1 per match).
+    GAP_WEIGHT = num_matches + 1
     obj_terms = []
 
     for p_idx, match_list in player_matches.items():
@@ -1080,7 +1169,7 @@ def _solve_phase2_cpsat(
             model.AddAbsEquality(abs_diff, diff)
             sq = model.NewIntVar(0, span * span, f"sq_p{p_idx}")
             model.AddMultiplicationEquality(sq, abs_diff, abs_diff)
-            obj_terms.append(sq)
+            obj_terms.append(GAP_WEIGHT * sq)
 
         elif n_matches == 3:
             m1, m2, m3 = match_list
@@ -1106,8 +1195,14 @@ def _solve_phase2_cpsat(
             sq2 = model.NewIntVar(0, (max_slot - min_slot) ** 2, f"sq2_p{p_idx}")
             model.AddMultiplicationEquality(sq1, gap1, gap1)
             model.AddMultiplicationEquality(sq2, gap2, gap2)
-            obj_terms.append(sq1)
-            obj_terms.append(sq2)
+            obj_terms.append(GAP_WEIGHT * sq1)
+            obj_terms.append(GAP_WEIGHT * sq2)
+
+    # Earliness tiebreaker: prefer earlier slots when gap-equivalent.
+    # Weight is 1 per match, guaranteed < GAP_WEIGHT so a single gap²
+    # increase of 1 (delta = GAP_WEIGHT) outweighs all earliness savings.
+    for m_idx in range(num_matches):
+        obj_terms.append(slot_of[m_idx])
 
     if obj_terms:
         model.Minimize(sum(obj_terms))
